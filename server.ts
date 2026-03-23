@@ -48,6 +48,20 @@ try {
 const TOKEN = process.env.DISCORD_BOT_TOKEN
 const STATIC = process.env.DISCORD_ACCESS_MODE === 'static'
 
+// Channel filter — when set, this server instance only handles messages
+// from the specified channel(s). Enables multi-agent setups where each
+// Claude Code session is bound to a specific Discord channel.
+// Comma-separated list of channel IDs, or empty/unset for "handle all".
+const CHANNEL_FILTER: Set<string> | null = (() => {
+  const raw = process.env.DISCORD_CHANNEL_FILTER
+  if (!raw) return null
+  const ids = raw.split(',').map(s => s.trim()).filter(Boolean)
+  if (ids.length > 0) {
+    process.stderr.write(`discord channel: filtering to channel(s): ${ids.join(', ')}\n`)
+  }
+  return ids.length > 0 ? new Set(ids) : null
+})()
+
 if (!TOKEN) {
   process.stderr.write(
     `discord channel: DISCORD_BOT_TOKEN required\n` +
@@ -221,6 +235,17 @@ function noteSent(id: string): void {
 }
 
 async function gate(msg: Message): Promise<GateResult> {
+  // Channel filter — drop messages not targeting this instance's channel(s).
+  if (CHANNEL_FILTER) {
+    const isDM = msg.channel.type === ChannelType.DM
+    const channelId = isDM
+      ? msg.channelId
+      : msg.channel.isThread()
+        ? msg.channel.parentId ?? msg.channelId
+        : msg.channelId
+    if (!CHANNEL_FILTER.has(channelId)) return { action: 'drop' }
+  }
+
   const access = loadAccess()
   const pruned = pruneExpired(access)
   if (pruned) saveAccess(access)
@@ -391,6 +416,19 @@ async function fetchTextChannel(id: string) {
 // Thread → parent lookup mirrors the inbound gate.
 async function fetchAllowedChannel(id: string) {
   const ch = await fetchTextChannel(id)
+
+  // Channel filter — block outbound to channels this instance doesn't own.
+  if (CHANNEL_FILTER) {
+    const key = ch.type === ChannelType.DM
+      ? ch.id
+      : ch.isThread()
+        ? ch.parentId ?? ch.id
+        : ch.id
+    if (!CHANNEL_FILTER.has(key)) {
+      throw new Error(`channel ${id} is not assigned to this instance (DISCORD_CHANNEL_FILTER)`)
+    }
+  }
+
   const access = loadAccess()
   if (ch.type === ChannelType.DM) {
     if (access.allowFrom.includes(ch.recipientId)) return ch
@@ -732,7 +770,8 @@ async function handleInbound(msg: Message): Promise<void> {
 }
 
 client.once('ready', c => {
-  process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
+  const filterInfo = CHANNEL_FILTER ? ` (filtered to: ${[...CHANNEL_FILTER].join(', ')})` : ' (all channels)'
+  process.stderr.write(`discord channel: gateway connected as ${c.user.tag}${filterInfo}\n`)
 })
 
 client.login(TOKEN).catch(err => {
