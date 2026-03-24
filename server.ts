@@ -501,6 +501,9 @@ const mcp = new Server(
   },
 )
 
+// Stores full permission details for "See more" expansion keyed by request_id.
+const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
+
 // Receive permission_request from CC → format → send to all allowlisted DMs.
 // Groups are intentionally excluded — the security thread resolution was
 // "single-user mode for official plugins." Anyone in access.allowFrom
@@ -517,12 +520,14 @@ mcp.setNotificationHandler(
   }),
   async ({ params }) => {
     const { request_id, tool_name, description, input_preview } = params
+    pendingPermissions.set(request_id, { tool_name, description, input_preview })
     const access = loadAccess()
-    const text =
-      `🔐 Permission request [${request_id}]\n` +
-      `${tool_name}: ${description}\n` +
-      `${input_preview}`
+    const text = `🔐 Permission: ${tool_name}`
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`perm:more:${request_id}`)
+        .setLabel('See more')
+        .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId(`perm:allow:${request_id}`)
         .setLabel('Allow')
@@ -772,11 +777,11 @@ client.on('error', err => {
 })
 
 // Button-click handler for permission requests. customId is
-// `perm:allow:<id>` or `perm:deny:<id>` — set when the request was sent.
+// `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
 // Security mirrors the text-reply path: allowFrom must contain the sender.
 client.on('interactionCreate', async (interaction: Interaction) => {
   if (!interaction.isButton()) return
-  const m = /^perm:(allow|deny):([a-km-z]{5})$/.exec(interaction.customId)
+  const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(interaction.customId)
   if (!m) return
   const access = loadAccess()
   if (!access.allowFrom.includes(interaction.user.id)) {
@@ -784,10 +789,46 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     return
   }
   const [, behavior, request_id] = m
+
+  if (behavior === 'more') {
+    const details = pendingPermissions.get(request_id)
+    if (!details) {
+      await interaction.reply({ content: 'Details no longer available.', ephemeral: true }).catch(() => {})
+      return
+    }
+    const { tool_name, description, input_preview } = details
+    let prettyInput: string
+    try {
+      prettyInput = JSON.stringify(JSON.parse(input_preview), null, 2)
+    } catch {
+      prettyInput = input_preview
+    }
+    const expanded =
+      `🔐 Permission: ${tool_name}\n\n` +
+      `tool_name: ${tool_name}\n` +
+      `description: ${description}\n` +
+      `input_preview:\n${prettyInput}`
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`perm:allow:${request_id}`)
+        .setLabel('Allow')
+        .setEmoji('✅')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`perm:deny:${request_id}`)
+        .setLabel('Deny')
+        .setEmoji('❌')
+        .setStyle(ButtonStyle.Danger),
+    )
+    await interaction.update({ content: expanded, components: [row] }).catch(() => {})
+    return
+  }
+
   void mcp.notification({
     method: 'notifications/claude/channel/permission',
     params: { request_id, behavior },
   })
+  pendingPermissions.delete(request_id)
   const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
   // Replace buttons with the outcome so the same request can't be answered
   // twice and the chat history shows what was chosen.
