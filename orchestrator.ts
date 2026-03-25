@@ -26,7 +26,7 @@ import {
   type TextChannel,
   type NonThreadGuildBasedChannel,
 } from 'discord.js'
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 
@@ -64,9 +64,9 @@ const CLAUDE_BIN      = process.env.CLAUDE_BIN ?? 'claude'
 const CLAUDE_FLAGS    = (process.env.CLAUDE_FLAGS ?? '--dangerously-skip-permissions')
   .split(' ')
   .filter(Boolean)
-const AGENT_WORKDIR   = process.env.DISCORD_AGENT_WORKDIR ?? homedir()
 
-// Channels that must never get a spawned session.
+// Channels that must never get a spawned session via the auto-scan.
+// The orchestrator channel is spawned explicitly in ready().
 const RESERVED: Set<string> = new Set([
   ORCHESTRATOR_CHANNEL,
   DASHBOARD_CHANNEL,
@@ -74,9 +74,10 @@ const RESERVED: Set<string> = new Set([
   ...(process.env.DISCORD_EXCLUDE_CHANNELS ?? '').split(',').map(s => s.trim()),
 ].filter((x): x is string => Boolean(x)))
 
-const STATE_FILE    = join(STATE_DIR, 'orchestrator-state.json')
+const STATE_FILE     = join(STATE_DIR, 'orchestrator-state.json')
 const DASHBOARD_FILE = join(STATE_DIR, 'orchestrator-dashboard.json')
-const ACCESS_FILE   = join(STATE_DIR, 'access.json')
+const ACCESS_FILE    = join(STATE_DIR, 'access.json')
+const WORKSPACES_DIR = join(STATE_DIR, 'workspaces')
 
 // ─── Access helpers ──────────────────────────────────────────────────────────
 
@@ -92,7 +93,6 @@ function writeAccessFile(a: AccessFile): void {
   writeFileSync(ACCESS_FILE, JSON.stringify(a, null, 2) + '\n')
 }
 
-/** Add a guild channel to access.groups so server.ts delivers its messages. */
 function registerChannelAccess(channelId: string): void {
   const a = readAccessFile()
   a.groups ??= {}
@@ -103,7 +103,6 @@ function registerChannelAccess(channelId: string): void {
   }
 }
 
-/** Remove a guild channel from access.groups on session teardown. */
 function unregisterChannelAccess(channelId: string): void {
   const a = readAccessFile()
   if (a.groups && a.groups[channelId]) {
@@ -111,6 +110,89 @@ function unregisterChannelAccess(channelId: string): void {
     writeAccessFile(a)
     process.stderr.write(`orchestrator: unregistered channel ${channelId} from access.json\n`)
   }
+}
+
+// ─── Workspace helpers ───────────────────────────────────────────────────────
+
+function workspaceDir(channelId: string): string {
+  return join(WORKSPACES_DIR, channelId)
+}
+
+function purgeWorkspace(channelId: string): void {
+  const wdir = workspaceDir(channelId)
+  try { rmSync(wdir, { recursive: true, force: true }) } catch {}
+  process.stderr.write(`orchestrator: purged workspace for ${channelId}\n`)
+}
+
+// ─── Orchestrator CLAUDE.md ──────────────────────────────────────────────────
+
+function generateOrchestratorClaudeMd(): string {
+  const all = [...sessions.values()].filter(s => s.channelId !== ORCHESTRATOR_CHANNEL)
+  const sessionList = all.length === 0
+    ? '  (aucune session active)'
+    : all.map(s =>
+        `  - **#${s.channelName}** (\`${s.channelId}\`) — ${s.status}` +
+        (s.restartCount > 0 ? ` — ${s.restartCount} restart(s)` : ''),
+      ).join('\n')
+
+  return `# Rôle : Orchestrateur Claude
+
+Tu es l'agent de contrôle d'un système multi-agents Claude Code connecté à Discord.
+Chaque salon Discord actif a sa propre session Claude Code isolée avec son propre contexte.
+
+## Tes responsabilités
+
+- Répondre aux questions sur le statut des sessions
+- Diagnostiquer les sessions bloquées ou crashées
+- Déclencher un restart manuel si nécessaire
+- Expliquer l'architecture du système
+
+## Architecture
+
+- **Orchestrateur Bun** — spawne et surveille les sessions Claude
+- **State file** : \`${STATE_FILE}\`
+- **Workspaces** : \`${WORKSPACES_DIR}/<channelId>/\` — contexte Claude par session (persisté)
+- **Access** : \`${ACCESS_FILE}\` — contrôle d'accès Discord
+
+## Commandes utiles
+
+### Statut live des sessions
+\`\`\`bash
+cat '${STATE_FILE}'
+\`\`\`
+
+### Voir les logs d'une session
+\`\`\`bash
+tmux capture-pane -t discord-<channelId> -p
+\`\`\`
+
+### Attacher une session
+\`\`\`bash
+tmux attach -t discord-<channelId>
+\`\`\`
+
+### Restart manuel d'une session bloquée
+\`\`\`bash
+tmux kill-session -t discord-<channelId>
+\`\`\`
+Le health monitor Bun détecte la disparition et respawn automatiquement avec \`--continue\`.
+
+### Lister les tmux sessions actives
+\`\`\`bash
+tmux list-sessions
+\`\`\`
+
+## Sessions au démarrage de ce contexte
+
+${sessionList}
+
+## Règles importantes
+
+- Ne crée PAS de nouveaux salons Discord — c'est le rôle du processus Bun.
+- Ne modifie PAS \`access.json\` directement — utilise les commandes dédiées.
+- Un restart via \`tmux kill-session\` est sûr : le workspace est préservé, la session reprend avec \`--continue\`.
+- Le seul moment où le contexte d'une session est perdu : suppression du salon Discord.
+`
 }
 
 // ─── Session registry ────────────────────────────────────────────────────────
@@ -163,18 +245,16 @@ async function tmuxKill(name: string): Promise<void> {
   await proc.exited
 }
 
-async function tmuxSpawn(name: string, channelId: string): Promise<boolean> {
-  // tmux inherits the orchestrator's env (including DISCORD_BOT_TOKEN).
-  // We only override DISCORD_CHANNEL_FILTER for each agent session.
-  // -c sets the working directory for the session.
+async function tmuxSpawn(name: string, channelId: string, workdir: string, resume: boolean): Promise<boolean> {
+  const resumeFlags = resume ? ['--continue'] : []
   const proc = Bun.spawn(
     [
       'tmux', 'new-session', '-d',
       '-s', name,
-      '-c', AGENT_WORKDIR,
+      '-c', workdir,
       '-e', `DISCORD_CHANNEL_FILTER=${channelId}`,
       '--',
-      CLAUDE_BIN, ...CLAUDE_FLAGS, '--channels', 'plugin:discord@claude-plugins-official',
+      CLAUDE_BIN, ...CLAUDE_FLAGS, ...resumeFlags, '--channels', 'plugin:discord@claude-plugins-official',
     ],
     { stdout: 'ignore', stderr: 'pipe' },
   )
@@ -185,8 +265,17 @@ async function tmuxSpawn(name: string, channelId: string): Promise<boolean> {
 
 async function startSession(channelId: string, channelName: string): Promise<void> {
   const name = tmuxName(channelId)
-
   if (await tmuxHasSession(name)) await tmuxKill(name)
+
+  // Workspace existence determines whether to resume or start fresh.
+  const wdir = workspaceDir(channelId)
+  const resume = existsSync(wdir)
+  mkdirSync(wdir, { recursive: true })
+
+  // Regenerate orchestrator context on every (re)start.
+  if (channelId === ORCHESTRATOR_CHANNEL) {
+    writeFileSync(join(wdir, 'CLAUDE.md'), generateOrchestratorClaudeMd())
+  }
 
   const existing = sessions.get(channelId)
   const session: Session = {
@@ -203,7 +292,7 @@ async function startSession(channelId: string, channelName: string): Promise<voi
 
   registerChannelAccess(channelId)
 
-  const ok = await tmuxSpawn(name, channelId)
+  const ok = await tmuxSpawn(name, channelId, wdir, resume)
   if (!ok) {
     session.status = 'crashed'
     session.lastCrashAt = Date.now()
@@ -212,20 +301,22 @@ async function startSession(channelId: string, channelName: string): Promise<voi
     return
   }
 
+  const verb = resume ? '🔄 reprise' : '🟢 démarrée'
   await logEvent(
-    `🟢 Session **#${channelName}** démarrée\n` +
+    `${verb} Session **#${channelName}**\n` +
     `   \`tmux attach -t ${name}\``,
   )
   updateDashboard().catch(() => {})
 }
 
-async function stopSession(channelId: string, reason?: string): Promise<void> {
+async function stopSession(channelId: string, reason?: string, purge = false): Promise<void> {
   const s = sessions.get(channelId)
   if (!s) return
   s.status = 'stopped'
   saveState()
   await tmuxKill(s.tmuxSession)
   unregisterChannelAccess(channelId)
+  if (purge) purgeWorkspace(channelId)
   await logEvent(`🔴 Session **#${s.channelName}** arrêtée${reason ? ` — ${reason}` : ''}`)
   updateDashboard().catch(() => {})
 }
@@ -312,6 +403,7 @@ function renderDashboard(): string {
         s.status === 'running'    ? '✅' :
         s.status === 'restarting' ? '🔄' :
         s.status === 'crashed'    ? '💥' : '⬛'
+      const label = s.channelId === ORCHESTRATOR_CHANNEL ? `🎛️ **#${s.channelName}**` : `**#${s.channelName}**`
       const since =
         s.status === 'running'
           ? ` — depuis <t:${Math.floor(s.startedAt / 1000)}:R>`
@@ -319,7 +411,7 @@ function renderDashboard(): string {
           ? ` — crash <t:${Math.floor(s.lastCrashAt / 1000)}:R>`
           : ''
       const restarts = s.restartCount > 0 ? ` *(${s.restartCount} restart)*` : ''
-      lines.push(`  ${icon} **#${s.channelName}**${since}${restarts}`)
+      lines.push(`  ${icon} ${label}${since}${restarts}`)
     }
   }
 
@@ -395,7 +487,8 @@ client.on('channelCreate', async channel => {
 
 client.on('channelDelete', async channel => {
   if (!sessions.has(channel.id)) return
-  await stopSession(channel.id, 'salon supprimé')
+  // purge = true: channel deleted = lose context intentionally
+  await stopSession(channel.id, 'salon supprimé', true)
 })
 
 client.on('error', err => {
@@ -405,11 +498,11 @@ client.on('error', err => {
 client.once('ready', async c => {
   process.stderr.write(`orchestrator: ready as ${c.user.tag}\n`)
   mkdirSync(STATE_DIR, { recursive: true })
+  mkdirSync(WORKSPACES_DIR, { recursive: true })
 
-  const orchId = ORCHESTRATOR_CHANNEL
-  if (orchId) {
+  if (ORCHESTRATOR_CHANNEL) {
     try {
-      const ch = (await client.channels.fetch(orchId)) as TextChannel
+      const ch = (await client.channels.fetch(ORCHESTRATOR_CHANNEL)) as TextChannel
       await ch.send(
         `🤖 **Orchestrateur démarré** — ${c.user.tag}\n` +
         `Écoute : ${CATEGORY_ID ? `catégorie \`${CATEGORY_ID}\`` : `préfixe \`${CHANNEL_PREFIX}\``}` +
@@ -442,6 +535,11 @@ client.once('ready', async c => {
     await logEvent(`🔍 ${spawned} session${spawned > 1 ? 's' : ''} démarrée${spawned > 1 ? 's' : ''} pour les salons existants`)
   }
 
+  // Spawn the orchestrator's own Claude session.
+  if (ORCHESTRATOR_CHANNEL) {
+    await startSession(ORCHESTRATOR_CHANNEL, 'orchestrateur')
+  }
+
   await updateDashboard()
   setInterval(healthCheck, 30_000)
 })
@@ -451,7 +549,8 @@ client.once('ready', async c => {
 async function shutdown(): Promise<void> {
   process.stderr.write('orchestrator: shutting down\n')
   for (const s of sessions.values()) {
-    if (s.status !== 'stopped') await stopSession(s.channelId)
+    // purge = false: keep workspaces so sessions resume on next boot
+    if (s.status !== 'stopped') await stopSession(s.channelId, undefined, false)
   }
   client.destroy()
   process.exit(0)
