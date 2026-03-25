@@ -1,0 +1,432 @@
+#!/usr/bin/env bun
+/**
+ * Discord Orchestrator — auto-spawns Claude Code sessions per Discord channel.
+ *
+ * Usage: bun orchestrator.ts
+ *
+ * Config (env vars, or ~/.claude/channels/discord/.env):
+ *   DISCORD_BOT_TOKEN              required — same token as server.ts
+ *   DISCORD_ORCHESTRATOR_CHANNEL   channel ID where Claude agent manages sessions
+ *   DISCORD_DASHBOARD_CHANNEL      channel ID for the live-edited dashboard message
+ *   DISCORD_LOGS_CHANNEL           channel ID for session event logs
+ *   DISCORD_CHANNEL_PREFIX         name prefix to watch (default: "claude-")
+ *   DISCORD_CATEGORY_ID            watch all channels in this category ID (overrides prefix)
+ *   DISCORD_EXCLUDE_CHANNELS       comma-separated channel IDs to never spawn (auto-includes the 3 special channels)
+ *   DISCORD_MAX_SESSIONS           max concurrent sessions (default: 10)
+ *   DISCORD_AGENT_WORKDIR          working directory for spawned Claude sessions (default: $HOME)
+ *   DISCORD_STATE_DIR              state dir (default: ~/.claude/channels/discord)
+ *   CLAUDE_BIN                     claude binary path (default: "claude")
+ *   CLAUDE_FLAGS                   extra flags (default: "--dangerously-skip-permissions")
+ */
+
+import {
+  Client,
+  GatewayIntentBits,
+  ChannelType,
+  type TextChannel,
+  type NonThreadGuildBasedChannel,
+} from 'discord.js'
+import { readFileSync, writeFileSync, mkdirSync } from 'fs'
+import { homedir } from 'os'
+import { join } from 'path'
+
+// ─── Config ─────────────────────────────────────────────────────────────────
+
+const STATE_DIR =
+  process.env.DISCORD_STATE_DIR ??
+  join(homedir(), '.claude', 'channels', 'discord')
+const ENV_FILE = join(STATE_DIR, '.env')
+
+try {
+  for (const line of readFileSync(ENV_FILE, 'utf8').split('\n')) {
+    const m = line.match(/^(\w+)=(.*)$/)
+    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
+  }
+} catch {}
+
+const TOKEN = process.env.DISCORD_BOT_TOKEN
+if (!TOKEN) {
+  process.stderr.write(
+    'orchestrator: DISCORD_BOT_TOKEN required\n' +
+    `  set in ${ENV_FILE}\n`,
+  )
+  process.exit(1)
+}
+
+const ORCHESTRATOR_CHANNEL = process.env.DISCORD_ORCHESTRATOR_CHANNEL ?? null
+const DASHBOARD_CHANNEL    = process.env.DISCORD_DASHBOARD_CHANNEL    ?? null
+const LOGS_CHANNEL         = process.env.DISCORD_LOGS_CHANNEL         ?? null
+
+const CHANNEL_PREFIX = process.env.DISCORD_CHANNEL_PREFIX ?? 'claude-'
+const CATEGORY_ID    = process.env.DISCORD_CATEGORY_ID    ?? null
+const MAX_SESSIONS   = parseInt(process.env.DISCORD_MAX_SESSIONS ?? '10', 10)
+const CLAUDE_BIN      = process.env.CLAUDE_BIN ?? 'claude'
+const CLAUDE_FLAGS    = (process.env.CLAUDE_FLAGS ?? '--dangerously-skip-permissions')
+  .split(' ')
+  .filter(Boolean)
+const AGENT_WORKDIR   = process.env.DISCORD_AGENT_WORKDIR ?? homedir()
+
+// Channels that must never get a spawned session.
+const RESERVED: Set<string> = new Set([
+  ORCHESTRATOR_CHANNEL,
+  DASHBOARD_CHANNEL,
+  LOGS_CHANNEL,
+  ...(process.env.DISCORD_EXCLUDE_CHANNELS ?? '').split(',').map(s => s.trim()),
+].filter((x): x is string => Boolean(x)))
+
+const STATE_FILE    = join(STATE_DIR, 'orchestrator-state.json')
+const DASHBOARD_FILE = join(STATE_DIR, 'orchestrator-dashboard.json')
+
+// ─── Session registry ────────────────────────────────────────────────────────
+
+type SessionStatus = 'running' | 'crashed' | 'restarting' | 'stopped'
+
+type Session = {
+  channelId: string
+  channelName: string
+  status: SessionStatus
+  startedAt: number
+  restartCount: number
+  lastCrashAt: number | null
+  tmuxSession: string
+}
+
+const sessions = new Map<string, Session>()
+
+// Backoff: 5s → 15s → 30s → 60s → 5min
+const BACKOFF_MS = [5_000, 15_000, 30_000, 60_000, 300_000]
+
+function backoffMs(restartCount: number): number {
+  return BACKOFF_MS[Math.min(restartCount, BACKOFF_MS.length - 1)]
+}
+
+function tmuxName(channelId: string): string {
+  return `discord-${channelId}`
+}
+
+function saveState(): void {
+  mkdirSync(STATE_DIR, { recursive: true })
+  writeFileSync(STATE_FILE, JSON.stringify([...sessions.values()], null, 2) + '\n')
+}
+
+// ─── Tmux helpers ────────────────────────────────────────────────────────────
+
+async function tmuxHasSession(name: string): Promise<boolean> {
+  const proc = Bun.spawn(['tmux', 'has-session', '-t', name], {
+    stdout: 'ignore',
+    stderr: 'ignore',
+  })
+  return (await proc.exited) === 0
+}
+
+async function tmuxKill(name: string): Promise<void> {
+  const proc = Bun.spawn(['tmux', 'kill-session', '-t', name], {
+    stdout: 'ignore',
+    stderr: 'ignore',
+  })
+  await proc.exited
+}
+
+async function tmuxSpawn(name: string, channelId: string): Promise<boolean> {
+  // tmux inherits the orchestrator's env (including DISCORD_BOT_TOKEN).
+  // We only override DISCORD_CHANNEL_FILTER for each agent session.
+  // -c sets the working directory for the session.
+  const proc = Bun.spawn(
+    [
+      'tmux', 'new-session', '-d',
+      '-s', name,
+      '-c', AGENT_WORKDIR,
+      '-e', `DISCORD_CHANNEL_FILTER=${channelId}`,
+      '--',
+      CLAUDE_BIN, ...CLAUDE_FLAGS, '--channels', 'plugin:discord@claude-plugins-official',
+    ],
+    { stdout: 'ignore', stderr: 'pipe' },
+  )
+  return (await proc.exited) === 0
+}
+
+// ─── Session lifecycle ───────────────────────────────────────────────────────
+
+async function startSession(channelId: string, channelName: string): Promise<void> {
+  const name = tmuxName(channelId)
+
+  if (await tmuxHasSession(name)) await tmuxKill(name)
+
+  const existing = sessions.get(channelId)
+  const session: Session = {
+    channelId,
+    channelName,
+    status: 'running',
+    startedAt: Date.now(),
+    restartCount: existing?.restartCount ?? 0,
+    lastCrashAt: existing?.lastCrashAt ?? null,
+    tmuxSession: name,
+  }
+  sessions.set(channelId, session)
+  saveState()
+
+  const ok = await tmuxSpawn(name, channelId)
+  if (!ok) {
+    session.status = 'crashed'
+    session.lastCrashAt = Date.now()
+    saveState()
+    await logEvent(`❌ Impossible de démarrer **#${channelName}** (tmux failed)`)
+    return
+  }
+
+  await logEvent(
+    `🟢 Session **#${channelName}** démarrée\n` +
+    `   \`tmux attach -t ${name}\``,
+  )
+  updateDashboard().catch(() => {})
+}
+
+async function stopSession(channelId: string, reason?: string): Promise<void> {
+  const s = sessions.get(channelId)
+  if (!s) return
+  s.status = 'stopped'
+  saveState()
+  await tmuxKill(s.tmuxSession)
+  await logEvent(`🔴 Session **#${s.channelName}** arrêtée${reason ? ` — ${reason}` : ''}`)
+  updateDashboard().catch(() => {})
+}
+
+async function scheduleRestart(channelId: string): Promise<void> {
+  const s = sessions.get(channelId)
+  if (!s || s.status === 'stopped') return
+
+  const delay = backoffMs(s.restartCount)
+  s.status = 'restarting'
+  s.lastCrashAt = Date.now()
+  saveState()
+
+  await logEvent(
+    `⚠️ Session **#${s.channelName}** crash détecté\n` +
+    `   Restart dans ${delay / 1000}s (tentative #${s.restartCount + 1})`,
+  )
+  updateDashboard().catch(() => {})
+
+  setTimeout(async () => {
+    const current = sessions.get(channelId)
+    if (!current || current.status === 'stopped') return
+    current.restartCount++
+    await startSession(channelId, current.channelName)
+  }, delay)
+}
+
+// ─── Health monitor ──────────────────────────────────────────────────────────
+
+async function healthCheck(): Promise<void> {
+  for (const [channelId, session] of sessions) {
+    if (session.status !== 'running') continue
+    const alive = await tmuxHasSession(session.tmuxSession)
+    if (!alive) await scheduleRestart(channelId)
+  }
+  updateDashboard().catch(() => {})
+}
+
+// ─── Log channel (event stream) ──────────────────────────────────────────────
+
+async function logEvent(text: string): Promise<void> {
+  process.stderr.write(`orchestrator: ${text.replace(/\*\*/g, '').replace(/`/g, '')}\n`)
+  const channelId = LOGS_CHANNEL ?? ORCHESTRATOR_CHANNEL
+  if (!channelId) return
+  try {
+    const ch = (await client.channels.fetch(channelId)) as TextChannel
+    await ch.send(text)
+  } catch (err) {
+    process.stderr.write(`orchestrator: logEvent send failed: ${err}\n`)
+  }
+}
+
+// ─── Dashboard (live-edited pinned message) ──────────────────────────────────
+
+let dashboardMessageId: string | null = null
+
+try {
+  const d = JSON.parse(readFileSync(DASHBOARD_FILE, 'utf8'))
+  dashboardMessageId = d.messageId ?? null
+} catch {}
+
+function saveDashboardMeta(messageId: string): void {
+  mkdirSync(STATE_DIR, { recursive: true })
+  writeFileSync(DASHBOARD_FILE, JSON.stringify({ messageId }) + '\n')
+}
+
+function renderDashboard(): string {
+  const now = Math.floor(Date.now() / 1000)
+  const all = [...sessions.values()]
+  const running = all.filter(s => s.status === 'running').length
+
+  const lines: string[] = [
+    `📊 **Dashboard** — <t:${now}:R>`,
+    ``,
+    `🤖 **Agents actifs** : ${running} / ${all.length} (max ${MAX_SESSIONS})`,
+    ``,
+  ]
+
+  if (all.length === 0) {
+    lines.push('  *(aucune session)*')
+  } else {
+    for (const s of all) {
+      const icon =
+        s.status === 'running'    ? '✅' :
+        s.status === 'restarting' ? '🔄' :
+        s.status === 'crashed'    ? '💥' : '⬛'
+      const since =
+        s.status === 'running'
+          ? ` — depuis <t:${Math.floor(s.startedAt / 1000)}:R>`
+          : s.lastCrashAt
+          ? ` — crash <t:${Math.floor(s.lastCrashAt / 1000)}:R>`
+          : ''
+      const restarts = s.restartCount > 0 ? ` *(${s.restartCount} restart)*` : ''
+      lines.push(`  ${icon} **#${s.channelName}**${since}${restarts}`)
+    }
+  }
+
+  lines.push(``)
+  lines.push(
+    `⚙️ ${CATEGORY_ID ? `Catégorie \`${CATEGORY_ID}\`` : `Préfixe \`${CHANNEL_PREFIX}\``}` +
+    ` | \`tmux attach -t discord-<channel_id>\``,
+  )
+
+  return lines.join('\n')
+}
+
+async function updateDashboard(): Promise<void> {
+  const channelId = DASHBOARD_CHANNEL ?? ORCHESTRATOR_CHANNEL
+  if (!channelId) return
+  try {
+    const ch = (await client.channels.fetch(channelId)) as TextChannel
+    const text = renderDashboard()
+
+    if (dashboardMessageId) {
+      try {
+        const msg = await ch.messages.fetch(dashboardMessageId)
+        await msg.edit(text)
+        return
+      } catch {
+        dashboardMessageId = null
+      }
+    }
+
+    const sent = await ch.send(text)
+    dashboardMessageId = sent.id
+    saveDashboardMeta(sent.id)
+    try { await sent.pin() } catch {}
+  } catch (err) {
+    process.stderr.write(`orchestrator: dashboard update failed: ${err}\n`)
+  }
+}
+
+// ─── Channel matching ────────────────────────────────────────────────────────
+
+function shouldSpawn(channelId: string, channelName: string, categoryId: string | null): boolean {
+  if (RESERVED.has(channelId)) return false
+  if (CATEGORY_ID) return categoryId === CATEGORY_ID
+  return channelName.startsWith(CHANNEL_PREFIX)
+}
+
+// ─── Discord client ──────────────────────────────────────────────────────────
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
+})
+
+client.on('channelCreate', async channel => {
+  if (channel.isDMBased() || !channel.isTextBased()) return
+  if (channel.type === ChannelType.GuildCategory || channel.isThread()) return
+
+  const ch = channel as NonThreadGuildBasedChannel
+  const name  = 'name'     in ch ? (ch.name     as string)        : ''
+  const catId = 'parentId' in ch ? (ch.parentId as string | null) : null
+  if (!shouldSpawn(channel.id, name, catId)) return
+
+  if (sessions.size >= MAX_SESSIONS) {
+    await logEvent(`❌ Max sessions (${MAX_SESSIONS}) atteint — **#${name}** ignoré`)
+    return
+  }
+
+  await startSession(channel.id, name)
+})
+
+client.on('channelDelete', async channel => {
+  if (!sessions.has(channel.id)) return
+  await stopSession(channel.id, 'salon supprimé')
+})
+
+client.on('error', err => {
+  process.stderr.write(`orchestrator: client error: ${err}\n`)
+})
+
+client.once('ready', async c => {
+  process.stderr.write(`orchestrator: ready as ${c.user.tag}\n`)
+  mkdirSync(STATE_DIR, { recursive: true })
+
+  const orchId = ORCHESTRATOR_CHANNEL
+  if (orchId) {
+    try {
+      const ch = (await client.channels.fetch(orchId)) as TextChannel
+      await ch.send(
+        `🤖 **Orchestrateur démarré** — ${c.user.tag}\n` +
+        `Écoute : ${CATEGORY_ID ? `catégorie \`${CATEGORY_ID}\`` : `préfixe \`${CHANNEL_PREFIX}\``}` +
+        ` | Max : ${MAX_SESSIONS} sessions`,
+      )
+    } catch {}
+  }
+
+  // Scan existing matching channels.
+  let spawned = 0
+  for (const guild of c.guilds.cache.values()) {
+    const channels = await guild.channels.fetch()
+    for (const [id, ch] of channels) {
+      if (!ch || ch.isDMBased() || !ch.isTextBased()) continue
+      if (ch.type === ChannelType.GuildCategory || ch.isThread()) continue
+      const name  = 'name'     in ch ? (ch.name     as string)        : ''
+      const catId = 'parentId' in ch ? (ch.parentId as string | null) : null
+      if (!shouldSpawn(id, name, catId)) continue
+      if (sessions.size >= MAX_SESSIONS) break
+
+      const existing = sessions.get(id)
+      if (existing?.status === 'running' && await tmuxHasSession(existing.tmuxSession)) continue
+
+      await startSession(id, name)
+      spawned++
+    }
+  }
+
+  if (spawned > 0) {
+    await logEvent(`🔍 ${spawned} session${spawned > 1 ? 's' : ''} démarrée${spawned > 1 ? 's' : ''} pour les salons existants`)
+  }
+
+  await updateDashboard()
+  setInterval(healthCheck, 30_000)
+})
+
+// ─── Graceful shutdown ───────────────────────────────────────────────────────
+
+async function shutdown(): Promise<void> {
+  process.stderr.write('orchestrator: shutting down\n')
+  for (const s of sessions.values()) {
+    if (s.status !== 'stopped') await stopSession(s.channelId)
+  }
+  client.destroy()
+  process.exit(0)
+}
+
+process.on('SIGTERM', () => { void shutdown() })
+process.on('SIGINT',  () => { void shutdown() })
+process.on('unhandledRejection', err => {
+  process.stderr.write(`orchestrator: unhandled rejection: ${err}\n`)
+})
+
+// ─── Boot ────────────────────────────────────────────────────────────────────
+
+client.login(TOKEN).catch(err => {
+  process.stderr.write(`orchestrator: login failed: ${err}\n`)
+  process.exit(1)
+})
