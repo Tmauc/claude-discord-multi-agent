@@ -195,9 +195,55 @@ ${sessionList}
 `
 }
 
+// ─── Rate limit detection ────────────────────────────────────────────────────
+
+const RATE_LIMIT_PATTERNS = [
+  /rate.?limit/i,
+  /too many requests/i,
+  /overloaded/i,
+  /rate_limit_error/i,
+  /overloaded_error/i,
+]
+
+// Patterns to extract wait duration from Claude's error message.
+const RETRY_AFTER_PATTERNS: Array<[RegExp, number]> = [
+  [/(\d+)\s*hour/i,   3_600_000],
+  [/(\d+)\s*minute/i,    60_000],
+  [/(\d+)\s*second/i,     1_000],
+]
+
+// Base fallback delay: 10 min, doubles each unresolved attempt.
+const RATE_LIMIT_BASE_MS = 10 * 60_000
+
+async function tmuxCapturePane(name: string): Promise<string> {
+  const proc = Bun.spawn(['tmux', 'capture-pane', '-t', name, '-p', '-S', '-100'], {
+    stdout: 'pipe',
+    stderr: 'ignore',
+  })
+  await proc.exited
+  return await new Response(proc.stdout).text()
+}
+
+function parseRateLimitDelay(output: string, attempt: number): number {
+  for (const [pat, msPerUnit] of RETRY_AFTER_PATTERNS) {
+    const m = output.match(pat)
+    if (m) return parseInt(m[1]) * msPerUnit
+  }
+  // No duration found — exponential backoff starting at 10 min.
+  return RATE_LIMIT_BASE_MS * Math.pow(2, attempt)
+}
+
+async function tmuxSendEnter(name: string): Promise<void> {
+  const proc = Bun.spawn(['tmux', 'send-keys', '-t', name, '', 'Enter'], {
+    stdout: 'ignore',
+    stderr: 'ignore',
+  })
+  await proc.exited
+}
+
 // ─── Session registry ────────────────────────────────────────────────────────
 
-type SessionStatus = 'running' | 'crashed' | 'restarting' | 'stopped'
+type SessionStatus = 'running' | 'crashed' | 'restarting' | 'stopped' | 'rate_limited'
 
 type Session = {
   channelId: string
@@ -207,6 +253,8 @@ type Session = {
   restartCount: number
   lastCrashAt: number | null
   tmuxSession: string
+  rateLimitCount: number
+  rateLimitedUntil: number | null
 }
 
 const sessions = new Map<string, Session>()
@@ -286,6 +334,8 @@ async function startSession(channelId: string, channelName: string): Promise<voi
     restartCount: existing?.restartCount ?? 0,
     lastCrashAt: existing?.lastCrashAt ?? null,
     tmuxSession: name,
+    rateLimitCount: existing?.rateLimitCount ?? 0,
+    rateLimitedUntil: null,
   }
   sessions.set(channelId, session)
   saveState()
@@ -346,11 +396,72 @@ async function scheduleRestart(channelId: string): Promise<void> {
 
 // ─── Health monitor ──────────────────────────────────────────────────────────
 
+async function handleRateLimit(channelId: string): Promise<void> {
+  const s = sessions.get(channelId)
+  if (!s) return
+
+  const pane = await tmuxCapturePane(s.tmuxSession)
+  const delay = parseRateLimitDelay(pane, s.rateLimitCount)
+  const mins = Math.round(delay / 60_000)
+
+  s.status = 'rate_limited'
+  s.rateLimitCount++
+  s.rateLimitedUntil = Date.now() + delay
+  saveState()
+
+  await logEvent(
+    `⏳ Session **#${s.channelName}** rate limitée\n` +
+    `   Enter automatique dans ${mins < 60 ? `${mins}min` : `${Math.round(mins / 60)}h`} (tentative #${s.rateLimitCount})`,
+  )
+  updateDashboard().catch(() => {})
+
+  setTimeout(async () => {
+    const current = sessions.get(channelId)
+    if (!current || current.status === 'stopped') return
+
+    // Check if tmux is still alive; if not, fall back to a normal restart.
+    const alive = await tmuxHasSession(current.tmuxSession)
+    if (!alive) {
+      current.rateLimitedUntil = null
+      await scheduleRestart(channelId)
+      return
+    }
+
+    current.status = 'running'
+    current.rateLimitedUntil = null
+    saveState()
+
+    await tmuxSendEnter(current.tmuxSession)
+    await logEvent(`🔁 Session **#${current.channelName}** — Enter envoyé (retry rate limit)`)
+    updateDashboard().catch(() => {})
+  }, delay)
+}
+
 async function healthCheck(): Promise<void> {
   for (const [channelId, session] of sessions) {
+    if (session.status === 'rate_limited') {
+      // Still in wait window — check tmux is alive; restart if it crashed during wait.
+      const alive = await tmuxHasSession(session.tmuxSession)
+      if (!alive) {
+        session.rateLimitedUntil = null
+        await scheduleRestart(channelId)
+      }
+      continue
+    }
+
     if (session.status !== 'running') continue
+
     const alive = await tmuxHasSession(session.tmuxSession)
-    if (!alive) await scheduleRestart(channelId)
+    if (!alive) {
+      await scheduleRestart(channelId)
+      continue
+    }
+
+    // Scan output for rate limit prompts.
+    const pane = await tmuxCapturePane(session.tmuxSession)
+    if (RATE_LIMIT_PATTERNS.some(p => p.test(pane))) {
+      await handleRateLimit(channelId)
+    }
   }
   updateDashboard().catch(() => {})
 }
@@ -400,13 +511,16 @@ function renderDashboard(): string {
   } else {
     for (const s of all) {
       const icon =
-        s.status === 'running'    ? '✅' :
-        s.status === 'restarting' ? '🔄' :
-        s.status === 'crashed'    ? '💥' : '⬛'
+        s.status === 'running'      ? '✅' :
+        s.status === 'restarting'   ? '🔄' :
+        s.status === 'rate_limited' ? '⏳' :
+        s.status === 'crashed'      ? '💥' : '⬛'
       const label = s.channelId === ORCHESTRATOR_CHANNEL ? `🎛️ **#${s.channelName}**` : `**#${s.channelName}**`
       const since =
         s.status === 'running'
           ? ` — depuis <t:${Math.floor(s.startedAt / 1000)}:R>`
+          : s.status === 'rate_limited' && s.rateLimitedUntil
+          ? ` — retry <t:${Math.floor(s.rateLimitedUntil / 1000)}:R>`
           : s.lastCrashAt
           ? ` — crash <t:${Math.floor(s.lastCrashAt / 1000)}:R>`
           : ''
