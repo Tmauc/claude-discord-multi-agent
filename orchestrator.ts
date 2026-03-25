@@ -26,7 +26,7 @@ import {
   type TextChannel,
   type NonThreadGuildBasedChannel,
 } from 'discord.js'
-import { readFileSync, writeFileSync, mkdirSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 
@@ -76,6 +76,42 @@ const RESERVED: Set<string> = new Set([
 
 const STATE_FILE    = join(STATE_DIR, 'orchestrator-state.json')
 const DASHBOARD_FILE = join(STATE_DIR, 'orchestrator-dashboard.json')
+const ACCESS_FILE   = join(STATE_DIR, 'access.json')
+
+// ─── Access helpers ──────────────────────────────────────────────────────────
+
+type GroupPolicy = { requireMention: boolean; allowFrom: string[] }
+type AccessFile  = { dmPolicy?: string; allowFrom?: string[]; groups?: Record<string, GroupPolicy>; pending?: Record<string, unknown> }
+
+function readAccessFile(): AccessFile {
+  try { return JSON.parse(readFileSync(ACCESS_FILE, 'utf8')) as AccessFile } catch { return {} }
+}
+
+function writeAccessFile(a: AccessFile): void {
+  mkdirSync(STATE_DIR, { recursive: true })
+  writeFileSync(ACCESS_FILE, JSON.stringify(a, null, 2) + '\n')
+}
+
+/** Add a guild channel to access.groups so server.ts delivers its messages. */
+function registerChannelAccess(channelId: string): void {
+  const a = readAccessFile()
+  a.groups ??= {}
+  if (!a.groups[channelId]) {
+    a.groups[channelId] = { requireMention: false, allowFrom: [] }
+    writeAccessFile(a)
+    process.stderr.write(`orchestrator: registered channel ${channelId} in access.json\n`)
+  }
+}
+
+/** Remove a guild channel from access.groups on session teardown. */
+function unregisterChannelAccess(channelId: string): void {
+  const a = readAccessFile()
+  if (a.groups && a.groups[channelId]) {
+    delete a.groups[channelId]
+    writeAccessFile(a)
+    process.stderr.write(`orchestrator: unregistered channel ${channelId} from access.json\n`)
+  }
+}
 
 // ─── Session registry ────────────────────────────────────────────────────────
 
@@ -165,6 +201,8 @@ async function startSession(channelId: string, channelName: string): Promise<voi
   sessions.set(channelId, session)
   saveState()
 
+  registerChannelAccess(channelId)
+
   const ok = await tmuxSpawn(name, channelId)
   if (!ok) {
     session.status = 'crashed'
@@ -187,6 +225,7 @@ async function stopSession(channelId: string, reason?: string): Promise<void> {
   s.status = 'stopped'
   saveState()
   await tmuxKill(s.tmuxSession)
+  unregisterChannelAccess(channelId)
   await logEvent(`🔴 Session **#${s.channelName}** arrêtée${reason ? ` — ${reason}` : ''}`)
   updateDashboard().catch(() => {})
 }
