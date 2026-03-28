@@ -58,10 +58,12 @@ Navigate to **Bot**:
 
 Open the generated URL and add the bot to your server.
 
-### 3. Install this fork as a plugin
+### 3. Clone this repo
 
 ```sh
-/plugin install discord@Tmauc/claude-discord-multi-agent
+git clone https://github.com/Tmauc/claude-discord-multi-agent
+cd claude-discord-multi-agent
+bun install
 ```
 
 ### 4. Save the bot token
@@ -75,7 +77,7 @@ This writes `DISCORD_BOT_TOKEN=...` to `~/.claude/channels/discord/.env`.
 ### 5. Launch Claude Code with the channel flag
 
 ```sh
-claude --channels plugin:discord
+claude --channels plugin:discord --plugin-dir /path/to/claude-discord-multi-agent
 ```
 
 ### 6. Pair your Discord account
