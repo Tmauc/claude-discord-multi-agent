@@ -22,6 +22,7 @@ Unofficial fork of the Discord channel plugin from [`anthropics/claude-plugins-o
 | Auto-retry rate-limited sessions via tmux | ❌ | ✅ |
 | Persistent workspaces (`--continue` on restart) | ❌ | ✅ |
 | Auto-register/unregister guild channels in `access.json` | ❌ | ✅ |
+| **Scripts toolkit** (session mgmt, access, server setup) | ❌ | ✅ |
 
 ---
 
@@ -112,25 +113,28 @@ Add **Manage Messages** in the Developer Portal (for dashboard pinning).
 
 ### Special channels
 
-Create these three channels in your Discord server:
+The orchestrator needs three dedicated channels. The easiest way is to let the setup script create them automatically:
 
-| Channel | Purpose |
-|---|---|
-| `claude-orchestrateur` | Boot message + orchestrator's own Claude agent |
-| `claude-dashboard` | Live-edited pinned message with all agent statuses |
-| `claude-logs` | Event stream (started / crashed / restarted) |
+```sh
+cd /path/to/claude-discord-multi-agent
+bun run setup-server
+```
 
-Enable Developer Mode (Discord Settings → Advanced), right-click each channel → **Copy Channel ID**.
+This creates `#claude-orchestrateur`, `#claude-dashboard`, and `#claude-logs` in your server and writes their IDs to `~/.claude/channels/discord/.env` automatically.
 
-### Configure
-
-Add to `~/.claude/channels/discord/.env`:
+**Manual alternative:** create the channels yourself, enable Developer Mode (Discord Settings → Advanced), right-click each → **Copy Channel ID**, then add to `.env`:
 
 ```sh
 DISCORD_ORCHESTRATOR_CHANNEL=<claude-orchestrateur ID>
 DISCORD_DASHBOARD_CHANNEL=<claude-dashboard ID>
 DISCORD_LOGS_CHANNEL=<claude-logs ID>
 ```
+
+| Channel | Purpose |
+|---|---|
+| `claude-orchestrateur` | Boot messages + orchestrator's own Claude agent |
+| `claude-dashboard` | Live-edited pinned message with all agent statuses |
+| `claude-logs` | Event stream (started / crashed / restarted) |
 
 ### Run
 
@@ -216,6 +220,40 @@ Text fallback (useful from mobile): reply `yes <id>` or `no <id>` where `<id>` i
 
 ---
 
+## Scripts toolkit
+
+All scripts live in `scripts/` and are callable with `bun scripts/<name>.ts` or via `bun run <name>`. They can also be called by the orchestrator agent in `#claude-orchestrateur` via Bash.
+
+### Server & setup
+
+| Script | Usage | Description |
+|---|---|---|
+| `setup-server.ts` | `bun run setup-server [guild-id]` | Create the 3 orchestrator channels + save IDs to `.env` |
+| `invite-url.ts` | `bun run invite-url` | Generate OAuth2 invite URL with correct permissions |
+| `check-permissions.ts` | `bun run check-permissions [guild-id]` | Verify bot has all required permissions |
+
+### Session management
+
+| Script | Usage | Description |
+|---|---|---|
+| `list-sessions.ts` | `bun run list-sessions` | Show all session statuses |
+| `create-channel.ts` | `bun run create-channel <name> [guild-id]` | Create `claude-<name>` channel — orchestrator auto-spawns |
+| `stop-session.ts` | `bun run stop-session <channel-id>` | Stop a session (no auto-restart) |
+| `restart-session.ts` | `bun run restart-session <channel-id>` | Force restart — orchestrator picks up within 30s |
+| `cleanup-session.ts` | `bun run cleanup-session <channel-id>` | Full cleanup: tmux + workspace + state + access |
+| `backup-workspaces.ts` | `bun run backup-workspaces [outdir]` | Archive all workspaces to a `.tar.gz` |
+| `update-dashboard.ts` | `bun run update-dashboard` | Force dashboard refresh without waiting 30s |
+
+### Access control
+
+| Script | Usage | Description |
+|---|---|---|
+| `list-access.ts` | `bun run list-access` | Show allowlists and channel policies |
+| `add-user.ts` | `bun run add-user <user-id> [channel-id]` | Add user to global DM or per-channel allowlist |
+| `remove-user.ts` | `bun run remove-user <user-id> [channel-id]` | Remove user from allowlist |
+
+---
+
 ## Access control
 
 See **[ACCESS.md](./ACCESS.md)** for DM policies, guild channels, mention detection, delivery configuration, skill commands, and the `access.json` schema.
@@ -267,6 +305,7 @@ Additions in this fork (no upstream equivalent):
 
 | Commit | Description |
 |---|---|
+| `0c84867` | feat: scripts/ toolkit — 13 Bun scripts for session mgmt, access, server setup |
 | `5c19fbb` | fix: route permission requests to session channel + richer messages |
 | `7f875ae` | feat: auto-retry rate limited sessions via tmux send-keys Enter |
 | `2ad6bcf` | feat: persistent workspaces with `--continue` on restart + orchestrator Claude session |
