@@ -504,10 +504,34 @@ const mcp = new Server(
 // Stores full permission details for "See more" expansion keyed by request_id.
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
 
-// Receive permission_request from CC → format → send to all allowlisted DMs.
-// Groups are intentionally excluded — the security thread resolution was
-// "single-user mode for official plugins." Anyone in access.allowFrom
-// already passed explicit pairing; group members haven't.
+// Build a compact summary line from tool_name + input_preview JSON.
+// Shows action type and the most relevant parameter (command, file path, etc.)
+// so the user knows what they're approving without opening "See more".
+function formatPermissionSummary(tool_name: string, input_preview: string): string {
+  let detail = ''
+  try {
+    const parsed = JSON.parse(input_preview) as Record<string, unknown>
+    if (tool_name === 'Bash' && typeof parsed.command === 'string') {
+      detail = `\`${parsed.command.slice(0, 120)}\``
+    } else if (['Read', 'Write', 'Edit', 'Glob', 'Grep'].includes(tool_name) && typeof parsed.file_path === 'string') {
+      detail = `\`${parsed.file_path}\``
+    } else if (typeof parsed.pattern === 'string') {
+      detail = `\`${parsed.pattern}\``
+    } else {
+      const firstKey = Object.keys(parsed)[0]
+      if (firstKey && typeof parsed[firstKey] === 'string') {
+        detail = `\`${(parsed[firstKey] as string).slice(0, 100)}\``
+      }
+    }
+  } catch {
+    if (input_preview) detail = `\`${input_preview.slice(0, 100)}\``
+  }
+  const channelCtx = CHANNEL_FILTER ? ` · <#${[...CHANNEL_FILTER][0]}>` : ''
+  return `🔐 **Permission needed** — \`${tool_name}\`${channelCtx}${detail ? `\n> ${detail}` : ''}`
+}
+
+// Receive permission_request from CC → format → send to the session channel
+// (CHANNEL_FILTER) if set, otherwise fall back to DMs of allowlisted users.
 mcp.setNotificationHandler(
   z.object({
     method: z.literal('notifications/claude/channel/permission_request'),
@@ -521,8 +545,7 @@ mcp.setNotificationHandler(
   async ({ params }) => {
     const { request_id, tool_name, description, input_preview } = params
     pendingPermissions.set(request_id, { tool_name, description, input_preview })
-    const access = loadAccess()
-    const text = `🔐 Permission: ${tool_name}`
+    const text = formatPermissionSummary(tool_name, input_preview)
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId(`perm:more:${request_id}`)
@@ -539,15 +562,32 @@ mcp.setNotificationHandler(
         .setEmoji('❌')
         .setStyle(ButtonStyle.Danger),
     )
-    for (const userId of access.allowFrom) {
+    // Route to the session channel when CHANNEL_FILTER is set.
+    // Fall back to DMs for sessions without a channel filter.
+    if (CHANNEL_FILTER) {
+      const channelId = [...CHANNEL_FILTER][0]
       void (async () => {
         try {
-          const user = await client.users.fetch(userId)
-          await user.send({ content: text, components: [row] })
+          const ch = await client.channels.fetch(channelId)
+          if (ch && ch.isTextBased()) {
+            await ch.send({ content: text, components: [row] })
+          }
         } catch (e) {
-          process.stderr.write(`permission_request send to ${userId} failed: ${e}\n`)
+          process.stderr.write(`permission_request send to channel ${channelId} failed: ${e}\n`)
         }
       })()
+    } else {
+      const access = loadAccess()
+      for (const userId of access.allowFrom) {
+        void (async () => {
+          try {
+            const user = await client.users.fetch(userId)
+            await user.send({ content: text, components: [row] })
+          } catch (e) {
+            process.stderr.write(`permission_request send to ${userId} failed: ${e}\n`)
+          }
+        })()
+      }
     }
   },
 )
