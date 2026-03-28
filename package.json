@@ -6,7 +6,20 @@
   "bin": "./server.ts",
   "scripts": {
     "start": "bun install --no-summary && bun server.ts",
-    "orchestrator": "bun install --no-summary && bun orchestrator.ts"
+    "orchestrator": "bun install --no-summary && bun orchestrator.ts",
+    "setup-server": "bun scripts/setup-server.ts",
+    "create-channel": "bun scripts/create-channel.ts",
+    "stop-session": "bun scripts/stop-session.ts",
+    "restart-session": "bun scripts/restart-session.ts",
+    "list-sessions": "bun scripts/list-sessions.ts",
+    "list-access": "bun scripts/list-access.ts",
+    "add-user": "bun scripts/add-user.ts",
+    "remove-user": "bun scripts/remove-user.ts",
+    "cleanup-session": "bun scripts/cleanup-session.ts",
+    "backup-workspaces": "bun scripts/backup-workspaces.ts",
+    "update-dashboard": "bun scripts/update-dashboard.ts",
+    "invite-url": "bun scripts/invite-url.ts",
+    "check-permissions": "bun scripts/check-permissions.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

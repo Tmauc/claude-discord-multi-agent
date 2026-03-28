@@ -186,12 +186,31 @@ tmux list-sessions
 
 ${sessionList}
 
+## Scripts disponibles
+
+Tous dans le répertoire du projet — utilise-les via Bash :
+
+| Script | Usage | Description |
+|--------|-------|-------------|
+| \`list-sessions.ts\` | \`bun scripts/list-sessions.ts\` | Statut de toutes les sessions |
+| \`list-access.ts\` | \`bun scripts/list-access.ts\` | Qui a accès à quoi |
+| \`create-channel.ts\` | \`bun scripts/create-channel.ts <nom>\` | Créer un nouveau canal agent |
+| \`stop-session.ts\` | \`bun scripts/stop-session.ts <channel-id>\` | Arrêter une session |
+| \`restart-session.ts\` | \`bun scripts/restart-session.ts <channel-id>\` | Forcer un restart |
+| \`cleanup-session.ts\` | \`bun scripts/cleanup-session.ts <channel-id>\` | Supprimer session + workspace |
+| \`add-user.ts\` | \`bun scripts/add-user.ts <user-id> [channel-id]\` | Ajouter un utilisateur |
+| \`remove-user.ts\` | \`bun scripts/remove-user.ts <user-id> [channel-id]\` | Retirer un utilisateur |
+| \`backup-workspaces.ts\` | \`bun scripts/backup-workspaces.ts\` | Archiver les workspaces |
+| \`update-dashboard.ts\` | \`bun scripts/update-dashboard.ts\` | Forcer refresh du dashboard |
+| \`check-permissions.ts\` | \`bun scripts/check-permissions.ts\` | Vérifier permissions du bot |
+| \`invite-url.ts\` | \`bun scripts/invite-url.ts\` | Générer URL d'invitation |
+| \`setup-server.ts\` | \`bun scripts/setup-server.ts [guild-id]\` | Setup initial d'un serveur |
+
 ## Règles importantes
 
-- Ne crée PAS de nouveaux salons Discord — c'est le rôle du processus Bun.
-- Ne modifie PAS \`access.json\` directement — utilise les commandes dédiées.
-- Un restart via \`tmux kill-session\` est sûr : le workspace est préservé, la session reprend avec \`--continue\`.
-- Le seul moment où le contexte d'une session est perdu : suppression du salon Discord.
+- Utilise les scripts ci-dessus plutôt que de modifier \`access.json\` directement.
+- Un restart via \`bun scripts/restart-session.ts\` ou \`tmux kill-session\` est sûr : le workspace est préservé, la session reprend avec \`--continue\`.
+- Le seul moment où le contexte d'une session est perdu : suppression du salon Discord (ou \`cleanup-session.ts\`).
 `
 }
 
