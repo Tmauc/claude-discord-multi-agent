@@ -234,8 +234,8 @@ const RETRY_AFTER_PATTERNS: Array<[RegExp, number]> = [
 // Base fallback delay: 10 min, doubles each unresolved attempt.
 const RATE_LIMIT_BASE_MS = 10 * 60_000
 
-async function tmuxCapturePane(name: string): Promise<string> {
-  const proc = Bun.spawn(['tmux', 'capture-pane', '-t', name, '-p', '-S', '-100'], {
+async function tmuxCapturePane(name: string, lines = 10): Promise<string> {
+  const proc = Bun.spawn(['tmux', 'capture-pane', '-t', name, '-p', '-S', `-${lines}`], {
     stdout: 'pipe',
     stderr: 'ignore',
   })
@@ -476,7 +476,9 @@ async function healthCheck(): Promise<void> {
       continue
     }
 
-    // Scan output for rate limit prompts.
+    // Scan only the last 10 lines for rate limit prompts.
+    // Limiting to recent output avoids false positives from old Discord
+    // history messages that may contain "rate limit" text from past events.
     const pane = await tmuxCapturePane(session.tmuxSession)
     if (RATE_LIMIT_PATTERNS.some(p => p.test(pane))) {
       await handleRateLimit(channelId)
