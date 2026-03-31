@@ -234,7 +234,7 @@ const RETRY_AFTER_PATTERNS: Array<[RegExp, number]> = [
 // Base fallback delay: 10 min, doubles each unresolved attempt.
 const RATE_LIMIT_BASE_MS = 10 * 60_000
 
-async function tmuxCapturePane(name: string, lines = 10): Promise<string> {
+async function tmuxCapturePane(name: string, lines = 5): Promise<string> {
   const proc = Bun.spawn(['tmux', 'capture-pane', '-t', name, '-p', '-S', `-${lines}`], {
     stdout: 'pipe',
     stderr: 'ignore',
